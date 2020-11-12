@@ -15,3 +15,7 @@ To run the code run following command:
 ```bash
 python pipeline.py ./gallery/ test.mp4
 ```
+
+## Results:
+
+Watch the video [here](https://youtu.be/p3N2CQ3r_Ks) to see results.
