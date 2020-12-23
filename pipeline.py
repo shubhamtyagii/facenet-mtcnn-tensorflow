@@ -8,9 +8,21 @@ import os
 import math
 import argparse
 import sys
+import multiprocessing
+import pickle
+import time
 
-facenet = Facenet('./models/facenet/facenet.pb')
-mtcnn = MTCNN('./models/mtcnn/',False)
+
+def facenet_run(task_q,result_q,e):
+    facenet = Facenet('./models/facenet/facenet.pb')
+    print('***facenet model loaded----->')
+    while(not e.is_set() or not task_q.empty()):
+        faces,image,bboxes = task_q.get()
+        if(faces.shape[0]>0):
+            embeddings = facenet.get_embeddings(faces)
+            result_q.put([embeddings,bboxes,image])
+        else:
+            result_q.put([[],None,image])
 
 def draw_data(img,bboxes,names,distances,margin = 10):
     overlay = img.copy()
@@ -29,7 +41,15 @@ def draw_data(img,bboxes,names,distances,margin = 10):
     cv2.addWeighted(overlay, alpha, img, 1 - alpha,0, img)
     return img
 
-def get_embeddings(image):
+def mtcnn_run(image,task_q,mtcnn):
+
+    # image = cv2.resize(image,(720,480))
+    bboxes,_,img = mtcnn.detect_faces(image)
+    faces = extract_face(image,bboxes)
+    # print('mtcnn run face shape',faces.shape)
+    task_q.put([faces,img,bboxes])
+    
+def get_embeddings_gallery(image,mtcnn,facenet):
 
     # image = cv2.resize(image,(720,480))
     bboxes,_,img = mtcnn.detect_faces(image)
@@ -40,18 +60,22 @@ def get_embeddings(image):
     return [],None,img
 
 def prepare_gallery(gallery_path):
+    facenet = Facenet('./models/facenet/facenet.pb')
+    mtcnn = MTCNN('./models/mtcnn/',False)
     image_names = glob.glob(gallery_path+'/*')
     gallery_embeddings = {}
     for image_name in image_names:
         img = cv2.imread(image_name)
         base_name = os.path.basename(image_name)
-        embeddings,_,_ = get_embeddings(img)
+        embeddings,_,_ = get_embeddings_gallery(img,mtcnn,facenet)
         if len(embeddings) == 0:
             print('No face detected for image',base_name)
         elif embeddings.shape[0] > 1:
             print('more than 1 one face detected for image:',base_name) 
         else:
             gallery_embeddings[base_name.split('.')[0]] = embeddings[0]
+    with open('gallery.pickle', 'wb') as handle:
+        pickle.dump(gallery_embeddings, handle, protocol=pickle.HIGHEST_PROTOCOL)
     return gallery_embeddings
 
 def extract_face(img,bboxes,margin = 10):
@@ -92,40 +116,93 @@ def distance(embeddings1, embeddings2, distance_metric=0):
         raise 'Undefined distance metric %d' % distance_metric 
         
     return dist
+
+# saves or diplays the results.
+def display_run(gallery,result_q,e,save = True):
+    print('running display------------------------------>')
+    count  = 0
+    start_time = time.time()
+    result = None
+    while not e.is_set():
+        embeddings,bboxes,frame = result_q.get()
+        if save and result is None:
+            result = cv2.VideoWriter('result.mp4',cv2.VideoWriter_fourcc(*'MP4V'), 25, (frame.shape[1],frame.shape[0])) 
+        count += 1
+        if(len(embeddings) > 0):
+            names,dist = get_nearest_match(gallery,embeddings)
+            frame = draw_data(frame,bboxes,names,dist)
+
+        if save:
+            result.write(frame)
+        else:
+            cv2.imshow('res',frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+        if(count == 30):
+            print('**fps=',30/(time.time()-start_time))
+            start_time = time.time() 
+            count = 0
+        
+
 def main(args):
-    print('preparing gallery....')
-    gallery = prepare_gallery(args.gallery_path)
-    print('gallery prepared')
+    mtcnn = MTCNN('./models/mtcnn/',False)
+    print('loading gallery....')
+    if(os.path.exists('gallery.pickle')):
+        with open('gallery.pickle', 'rb') as handle:
+            gallery = pickle.load(handle)
+    else:
+        gallery = prepare_gallery(args.gallery_path)
+    
+    print('gallery loaded')
     print('characters in gallery->',gallery.keys())
 
     consumer = Consumer(args.video_path)
     ret,frame = consumer.get_frame()
 
-    # result = cv2.VideoWriter('result.mp4',cv2.VideoWriter_fourcc(*'MP4V'), 25, (frame.shape[1],frame.shape[0])) 
+    task_q = multiprocessing.Queue()
+    result_q = multiprocessing.Queue()
+    e = multiprocessing.Event()
+    facenet = multiprocessing.Process(name='facenet', 
+                                 target=facenet_run,
+                                 args=(task_q,result_q,e))
+    display =  multiprocessing.Process(name='display', 
+                                 target=display_run,
+                                 args=(gallery,result_q,e))
+                            
+    facenet.start()
+    display.start()
+    try:
+        while(ret):
+        
+            mtcnn_run(frame,task_q,mtcnn)                
+            ret,frame = consumer.get_frame()
+        
+        e.set()
+        task_q.close()
+        consumer.release()
+        facenet.join()
+        display.join()
+    except Exception:
+        e.set()
+        task_q.close()
+        result_q.close()
+        consumer.release()
+        facenet.join()
+        display.join()
 
-    while(ret):
-        embeddings,bboxes,frame = get_embeddings(frame)
-        if(len(embeddings) > 0):
-            names,dist = get_nearest_match(gallery,embeddings)
-            frame = draw_data(frame,bboxes,names,dist)
-        cv2.imshow('res',frame)
-        # result.write(frame)
-        ret,frame = consumer.get_frame()
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-    consumer.release()
-# result.release()
 def parse_arguments(argv):
     parser = argparse.ArgumentParser()
     
     parser.add_argument('gallery_path', type=str, 
-        help='Directory containing the gallery images')
+        help='Directory containing the gallery images',default='gallery')
     parser.add_argument('video_path', type=str, 
-        help='Path of the input video file')
+        help='Path of the input video file',default='test.mp4')
     return parser.parse_args(argv)
 
 if __name__ == '__main__':
     main(parse_arguments(sys.argv[1:]))
+    # prepare_gallery('gallery')
 
 
 
